@@ -1,0 +1,206 @@
+import os
+import logging
+import asyncio
+import sqlite3
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from dotenv import load_dotenv
+
+# Sozlamalarni yuklash
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+
+# Loglarni sozlash
+logging.basicConfig(level=logging.INFO)
+
+# Bot va Dispatcher
+bot = Bot(token=TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+# Ma'lumotlar bazasini yangitdan va to'g'ri yaratish
+conn = sqlite3.connect("shop.db")
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    price TEXT,
+    photo_id TEXT
+)
+""")
+conn.commit()
+
+# Admin holatlari
+class AdminStates(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_price = State()
+    waiting_for_photo = State()
+
+# Asosiy menyu tugmalari (Pastki menyu)
+def get_main_keyboard(user_id):
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="🛍 Katalog")
+    builder.button(text="📦 Mening buyurtmalarim")
+    builder.button(text="🌐 Tilni tanlash")
+    builder.button(text="ℹ️ Do'kon haqida")
+    if user_id in ADMIN_IDS:
+        builder.button(text="🛠 Admin panel")
+    builder.adjust(2, 2, 1)
+    return builder.as_markup(resize_keyboard=True)
+
+# /start buyrug'i
+@dp.message(Command("start"))
+async def start_command(message: types.Message):
+    text = "👗 Do‘konimizga xush kelibsiz!\nMahsulotlarni ko‘rish yoki buyurtma berish uchun menyudan foydalaning."
+    await message.answer(text, reply_markup=get_main_keyboard(message.from_user.id))
+
+# Pastki "🛍 Katalog" tugmasi bosilganda
+@dp.message(F.text == "🛍 Katalog")
+async def view_catalog(message: types.Message):
+    cursor.execute("SELECT * FROM products")
+    products = cursor.fetchall()
+    
+    if not products:
+        await message.answer("❌ Hozircha do'konda mahsulotlar yo'q.")
+        return
+        
+    await message.answer("🛒 Mavjud mahsulotlar ro'yxati:")
+    for p in products:
+        p_id, name, price, photo_id = p
+        builder = InlineKeyboardBuilder()
+        builder.button(text=f"💳 Sotib olish ({price})", callback_data=f"buy_{p_id}")
+        
+        if photo_id:
+            await message.answer_photo(photo_id, caption=f"📦 **{name}**\n💰 Narxi: {price}", reply_markup=builder.as_markup(), parse_mode="Markdown")
+        else:
+            await message.answer(text=f"📦 **{name}**\n💰 Narxi: {price}", reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+# "🛠 Admin panel" tugmasi bosilganda
+@dp.message(F.text == "🛠 Admin panel")
+async def admin_panel(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Yangi mahsulot qo'shish", callback_data="admin_add")
+    builder.button(text="🗑 Mahsulotni o'chirish", callback_data="admin_delete_list")
+    builder.adjust(1)
+    
+    await message.answer("🛠 Admin boshqaruv paneli:", reply_markup=builder.as_markup())
+
+# Sotib olish tugmasi bosilganda (Sizga xabar boradi)
+@dp.callback_query(F.data.startswith("buy_"))
+async def buy_product(call: types.CallbackQuery):
+    p_id = int(call.data.split("_")[1])
+    cursor.execute("SELECT name, price FROM products WHERE id=?", (p_id,))
+    product = cursor.fetchone()
+    
+    if product:
+        name, price = product
+        buyer = call.from_user
+        
+        await call.message.answer(f"✅ **Buyurtmangiz rasmiylashtirildi!**\n\n📦 Mahsulot: {name}\n💰 Narxi: {price}\n\nOperator tez orada siz bilan bog'lanadi.")
+        
+        admin_message = (
+            f"🔔 **Yangi buyurtma tushdi!**\n\n"
+            f"📦 **Mahsulot:** {name}\n"
+            f"💰 **Narxi:** {price}\n\n"
+            f"👤 **Xaridor:**\n"
+            f"✍️ Ismi: {buyer.full_name}\n"
+            f"🆔 ID: `{buyer.id}`\n"
+        )
+        if buyer.username:
+            admin_message += f"🔗 Profil: @{buyer.username}\n"
+            
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(chat_id=admin_id, text=admin_message, parse_mode="Markdown")
+            except Exception as e:
+                logging.error(f"Adminga xabar yuborishda xato: {e}")
+    await call.answer()
+
+# ADMIN: Mahsulot qo'shish
+@dp.callback_query(F.data == "admin_add")
+async def admin_add_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+    await call.message.answer("1️⃣ Mahsulot nomini kiriting:")
+    await state.set_state(AdminStates.waiting_for_name)
+    await call.answer()
+
+@dp.message(AdminStates.waiting_for_name)
+async def admin_name_rcv(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("2️⃣ Mahsulot narxini kiriting (masalan: 50 000 so'm):")
+    await state.set_state(AdminStates.waiting_for_price)
+
+@dp.message(AdminStates.waiting_for_price)
+async def admin_price_rcv(message: types.Message, state: FSMContext):
+    await state.update_data(price=message.text)
+    await message.answer("3️⃣ Mahsulot rasmini yuboring:")
+    await state.set_state(AdminStates.waiting_for_photo)
+
+@dp.message(AdminStates.waiting_for_photo, F.photo)
+async def admin_photo_rcv(message: types.Message, state: FSMContext):
+    photo_id = message.photo[-1].file_id
+    data = await state.get_data()
+    
+    cursor.execute("INSERT INTO products (name, price, photo_id) VALUES (?, ?, ?)", (data['name'], data['price'], photo_id))
+    conn.commit()
+    
+    await message.answer("🎉 Mahsulot muvaffaqiyatli saqlandi!")
+    await state.clear()
+
+# ADMIN: O'chirish
+@dp.callback_query(F.data == "admin_delete_list")
+async def admin_delete_list(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+    cursor.execute("SELECT id, name FROM products")
+    products = cursor.fetchall()
+    
+    if not products:
+        await call.message.answer("❌ O'chirish uchun mahsulot yo'q.")
+        await call.answer()
+        return
+        
+    builder = InlineKeyboardBuilder()
+    for p_id, name in products:
+        builder.button(text=f"❌ {name}", callback_data=f"del_{p_id}")
+    builder.adjust(1)
+    await call.message.answer("O'chirish uchun mahsulotni tanlang:", reply_markup=builder.as_markup())
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("del_"))
+async def admin_delete_proc(call: types.CallbackQuery):
+    p_id = int(call.data.split("_")[1])
+    cursor.execute("DELETE FROM products WHERE id=?", (p_id,))
+    conn.commit()
+    await call.message.answer("🗑 Mahsulot do'kondan olib tashlandi!")
+    await call.answer()
+
+# Qolgan tugmalar uchun vaqtinchalik javoblar
+@dp.message(F.text == "📦 Mening buyurtmalarim")
+async def my_orders(message: types.Message):
+    await message.answer("📦 Buyurtmalaringiz tarixi hozircha bo'sh.")
+
+@dp.message(F.text == "🌐 Tilni tanlash")
+async def change_lang(message: types.Message):
+    await message.answer("🇺🇿 Hozircha faqat O'zbek tili mavjud.")
+
+@dp.message(F.text == "ℹ️ Do'kon haqida")
+async def about_shop(message: types.Message):
+    await message.answer("ℹ️ Bu do'kon boti orqali mahsulotlarni osongina sotib olishingiz mumkin.")
+
+async def main():
+    # Eski webhook bog'lanishini majburlab o'chirish
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
